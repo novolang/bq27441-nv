@@ -62,6 +62,14 @@ fn log_list(c: Chip) -> [Int]
 fn log_clear(c: Chip)
     c.st.insert(99, 0)
 
+// The register writes in a log whose register lies in lo..=hi, as the
+// flat pairs register, value in the order they were made.  A log entry
+// is a triple (kind, register, value), and kind 1 is a write.
+fn writes_in(l: [Int], lo: Int, hi: Int) -> [Int]
+    let empty: [Int] = []
+    list.flat_map(list.range(0, l.len() / 3),
+        k => (if l[3 * k] == 1 and l[3 * k + 1] >= lo and l[3 * k + 1] <= hi then [l[3 * k + 1], l[3 * k + 2]] else empty))
+
 // The State subclass, 82, as the -G1B ships it where the manual says so:
 // Design Capacity 1000 mAh at offset 10, Design Energy 3800 mWh at 12,
 // Terminate Voltage 3200 mV at 16, Taper Rate 100 at 27.  Offsets the
@@ -691,13 +699,7 @@ fn test_a_block_that_does_not_match_its_checksum_is_not_used() [io]
     // Nothing was written to the data memory or the block.
     test.assert_eq(dm_get(c, 82, 10), 1000)
     let l = log_list(c)
-    var wrote = false
-    var i = 0
-    while i < l.len()
-        if l[i] == 1 and l[i + 1] >= 0x40 and l[i + 1] <= 0x60
-            wrote = true
-        i = i + 3
-    test.assert(not wrote)
+    test.assert(list.is_empty(writes_in(l, 0x40, 0x60)))
 
 @test
 fn test_a_field_is_written_with_its_new_checksum() [io]
@@ -710,13 +712,7 @@ fn test_a_field_is_written_with_its_new_checksum() [io]
     log_clear(c)
     test.assert_eq(bq27441.dm_write_word(d, 82, 12, 0x1234), 1)
     let l = log_list(c)
-    var wr: [Int] = []
-    var i = 0
-    while i < l.len()
-        if l[i] == 1 and l[i + 1] >= 0x40 and l[i + 1] <= 0x60
-            list.push(wr, l[i + 1])
-            list.push(wr, l[i + 2])
-        i = i + 3
+    let wr = writes_in(l, 0x40, 0x60)
     // The two data bytes at 0x40 + 12, then the checksum register 0x60,
     // then the reselection of the block for the read back.
     test.assert_eq(wr[0], 0x4C)
@@ -730,13 +726,7 @@ fn test_a_field_is_written_with_its_new_checksum() [io]
     log_clear(c)
     test.assert_eq(bq27441.dm_write_word(d, 82, 12, 0x1234), 0)
     let m = log_list(c)
-    var again = false
-    var j = 0
-    while j < m.len()
-        if m[j] == 1 and m[j + 1] >= 0x40 and m[j + 1] <= 0x60
-            again = true
-        j = j + 3
-    test.assert(not again)
+    test.assert(list.is_empty(writes_in(m, 0x40, 0x60)))
 
 @test
 fn test_a_write_is_refused_where_it_cannot_be_done() [io]
@@ -825,12 +815,9 @@ fn test_a_sealed_part_is_unsealed_for_the_update_and_sealed_after() [io]
     test.assert_eq(at(c.st, 24), 1)
     // The order: the key twice, SET_CFGUPDATE, the exit, SEALED.
     let l = log_list(c)
-    var subs: [Int] = []
-    var i = 0
-    while i < l.len()
-        if l[i] == 1 and l[i + 1] == 0
-            list.push(subs, l[i + 2])
-        i = i + 3
+    let none: [Int] = []
+    let subs = list.flat_map(list.range(0, l.len() / 3),
+        k => (if l[3 * k] == 1 and l[3 * k + 1] == 0 then [l[3 * k + 2]] else none))
     test.assert(subs[0] == 0)
     test.assert_eq(subs[subs.len() - 1], 0x20)
     test.assert_eq(subs[subs.len() - 2], 0x42)
