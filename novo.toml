@@ -1,0 +1,24 @@
+[package]
+name        = "bq27441-nv"
+version     = "0.1.0"
+description = "A driver for TI's BQ27441-G1 single-cell fuel gauge on an I2C bus: voltage, average current, power, state of charge, remaining and full-charge capacity, temperature, state of health and the Flags bits, the Control subcommands and the seal and unseal keys, the configuration update that writes the design capacity, design energy, terminate voltage, taper rate and OpConfig through the data memory with its block checksum, and the device identity, as the battery side of devices-nv's PowerManager and Identifiable."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["bq27441", "fuel-gauge", "battery", "pmic", "i2c", "impedance-track", "ti", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/bq27441-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.1"
+
+[docs.pages]
+"README.md" = "Reading a BQ27441-G1 fuel gauge from a device program"
+
+[dependencies]
+# The board's I2C bus, timer and GPIO handles, the I2cBus, Timer and
+# GpioOut traits they implement, and the pin-edge trait of the awaitable
+# GPOUT line.
+embedded-hal-nv = "^0.3.3"
+# The wiring record a board's device table hands `attach`, the register
+# helpers, and the PowerManager and Identifiable traits.
+devices-nv      = "^0.3.3"

@@ -1,0 +1,1012 @@
+// bq27441_tests — the driver over a double of the gauge: a register file
+// that answers on an I2C bus the way TI's technical reference SLUUAC9A
+// and data sheet SLUSBH1C say a BQ27441-G1 does, so the framing, the
+// Control subcommands, the seal and the unseal key, the readings, the
+// data memory with its block checksum and the configuration update are
+// checked on the host, one packet at a time.
+//
+// The double's state, in `st`: 4 is 1 when a gauge is there, 70 the I2C
+// address, 20 and 21 the control byte written to register 0 and the last
+// subcommand, 22 the subcommand before it, 29 the I2C clock, 24 is 1 while sealed, 25
+// is 1 once INITCOMP is set, 26 the reads of CONTROL_STATUS that read
+// INITCOMP clear, 30 the Flags word except CFGUPMODE and ITPOR, 31 is 1
+// when ITPOR is set, 32 is 1 while CFGUPMODE is set, 33 the reads of Flags
+// that read CFGUPMODE as it was before the last subcommand, 34 the CFGUPMODE
+// that a subcommand will set, 35 is 1 when the gauge never enters the
+// mode, 36 is 1 when it never leaves it, 40 and 41 the data class and the
+// block selected, 27 is a DEVICE_TYPE other than 0x0421 (0 for none), 46 is
+// 1 more than the reads of register 0x60 after which it stops answering and
+// 47 the reads made, 95 is 1 more than the writes after which every write is
+// refused (0 for no limit) and 96 the writes made, 42 is 1 when the checksum written is ignored, 43 adds to
+// the checksum the gauge reports, 44 the block data control, 90 the
+// milliseconds paused, 91 the pauses, 99 the entries in the log.  `regs`
+// holds the standard registers, `dm` the data memory as one byte at
+// `class * 4096 + offset`, `stage` the 32 bytes of the selected block.
+// The log is: a register written is 1, the register and the value; a
+// register read is 2, the first register and the count.
+
+use std.test
+use core.rt
+use embedded_hal.{ BoardI2c, BoardTimer, BoardGpio, I2cBus, GpioOut, AsyncEdge }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_power.{ MilliVolts, MilliAmps, RailState, ChargeState, BatteryReading, PowerManager, PowerManagerAsync }
+use dev_id.{ DeviceId, Identifiable }
+use bq27441
+use bq27441.{ Bq27441, Bq27441Port, Bq27441Config, Bq27441Host }
+
+// ── The double ───────────────────────────────────────────────────────
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    dm: HashMap<Int, Int>
+    stage: HashMap<Int, Int>
+    deaf: HashMap<Int, Int>
+    mute: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+fn log_list(c: Chip) -> [Int]
+    var out: [Int] = []
+    for i in 0..at(c.st, 99)
+        list.push(out, at(c.log, i))
+    out
+
+fn log_clear(c: Chip)
+    c.st.insert(99, 0)
+
+// The State subclass, 82, as the -G1B ships it where the manual says so:
+// Design Capacity 1000 mAh at offset 10, Design Energy 3800 mWh at 12,
+// Terminate Voltage 3200 mV at 16, Taper Rate 100 at 27.  Offsets the
+// manual gives no value for hold bytes of the double's own.
+fn dm_word(c: Chip, class: Int, off: Int, v: Int)
+    c.dm.insert(class * 4096 + off, (v >> 8) & 0xFF)
+    c.dm.insert(class * 4096 + off + 1, v & 0xFF)
+
+fn dm_get(c: Chip, class: Int, off: Int) -> Int
+    (at(c.dm, class * 4096 + off) << 8) | at(c.dm, class * 4096 + off + 1)
+
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(),
+        st: HashMap.new(),
+        dm: HashMap.new(),
+        stage: HashMap.new(),
+        deaf: HashMap.new(),
+        mute: HashMap.new(),
+        log: HashMap.new() }
+    c.st.insert(4, 1)
+    c.st.insert(70, 0x55)
+    c.st.insert(25, 1)
+    c.st.insert(30, 0x0008)
+    dm_word(c, 82, 0, 16384)
+    dm_word(c, 82, 6, 3814)
+    dm_word(c, 82, 8, 3748)
+    dm_word(c, 82, 10, 1000)
+    dm_word(c, 82, 12, 3800)
+    dm_word(c, 82, 14, 5580)
+    dm_word(c, 82, 16, 3200)
+    dm_word(c, 82, 27, 100)
+    dm_word(c, 64, 0, 0x25F8)
+    c.regs.insert(0x3A, 0xF8)
+    c.regs.insert(0x3B, 0x25)
+    c.regs.insert(0x3C, 0xE8)
+    c.regs.insert(0x3D, 0x03)
+    c
+
+fn absent() -> Chip
+    let c = chip()
+    c.st.insert(4, 0)
+    c
+
+// Sets a standard word, low byte at the register.
+fn put(c: Chip, reg: Int, v: Int)
+    c.regs.insert(reg, v & 0xFF)
+    c.regs.insert(reg + 1, (v >> 8) & 0xFF)
+
+fn flags(c: Chip) -> Int
+    var v = at(c.st, 30)
+    if at(c.st, 31) == 1
+        v = v | 0x0020
+    if at(c.st, 32) == 1
+        v = v | 0x0010
+    v
+
+// The checksum of the staged block, 255 minus the low 8 bits of the sum.
+fn stage_sum(c: Chip) -> Int
+    var s = 0
+    for i in 0..32
+        s = s + at(c.stage, i)
+    255 - (s & 0xFF)
+
+// Loads the staged block from the data memory of the selected block.
+fn stage_load(c: Chip)
+    let base = at(c.st, 40) * 4096 + at(c.st, 41) * 32
+    for i in 0..32
+        c.stage.insert(i, at(c.dm, base + i))
+
+// A subcommand of Control, run when its second byte arrives.
+fn control_run(c: Chip, sub: Int)
+    let last = at(c.st, 21)
+    c.st.insert(22, last)
+    c.st.insert(21, sub)
+    if sub == 0x8000
+        if last == 0x8000
+            c.st.insert(24, 0)
+        return
+    var ans = 0
+    if sub == 0x0000
+        if at(c.st, 24) == 1
+            ans = ans | 0x2000
+        if at(c.st, 26) > 0
+            c.st.insert(26, at(c.st, 26) - 1)
+        elif at(c.st, 25) == 1
+            ans = ans | 0x0080
+    if sub == 0x0001
+        ans = 0x0421
+        if at(c.st, 27) != 0
+            ans = at(c.st, 27)
+    if sub == 0x0002
+        ans = 0x0109
+    if sub == 0x0004
+        ans = 0x0001
+    if sub == 0x0008
+        ans = 0x0312
+    if sub == 0x0020
+        c.st.insert(24, 1)
+    if sub == 0x0013 and at(c.st, 24) == 0
+        c.st.insert(34, 1)
+        if at(c.st, 35) == 0
+            c.st.insert(32, 1)
+    if sub == 0x0041
+        c.st.insert(31, 1)
+    if sub == 0x0042 or sub == 0x0043 or sub == 0x0044
+        if at(c.st, 36) == 0
+            c.st.insert(32, 0)
+            c.st.insert(31, 0)
+    c.regs.insert(0, ans & 0xFF)
+    c.regs.insert(1, (ans >> 8) & 0xFF)
+
+// A register as the gauge answers it.
+fn chip_read(c: Chip, reg: Int) -> Int
+    if reg == 0x06
+        return flags(c) & 0xFF
+    if reg == 0x07
+        return (flags(c) >> 8) & 0xFF
+    if reg == 0x60
+        return (stage_sum(c) + at(c.st, 43)) & 0xFF
+    if reg >= 0x40 and reg <= 0x5F
+        return at(c.stage, reg - 0x40)
+    at(c.regs, reg)
+
+// Whether the gauge refuses a write to the register while sealed.
+fn sealed_refuses(reg: Int) -> Bool
+    reg >= 0x3E and reg <= 0x61
+
+fn chip_write(c: Chip, reg: Int, v: Int)
+    if reg == 0
+        c.st.insert(20, v)
+        return
+    if reg == 1
+        control_run(c, at(c.st, 20) | (v << 8))
+        return
+    if reg == 0x3E
+        c.st.insert(40, v)
+        return
+    if reg == 0x3F
+        c.st.insert(41, v)
+        if at(c.st, 44) == 0
+            stage_load(c)
+        return
+    if reg == 0x61
+        c.st.insert(44, v)
+        return
+    if reg >= 0x40 and reg <= 0x5F
+        c.stage.insert(reg - 0x40, v)
+        return
+    if reg == 0x60
+        if at(c.st, 42) == 1
+            return
+        if v == stage_sum(c)
+            let base = at(c.st, 40) * 4096 + at(c.st, 41) * 32
+            for i in 0..32
+                c.dm.insert(base + i, at(c.stage, i))
+        return
+    c.regs.insert(reg, v & 0xFF)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(29, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr != at(self.c.st, 70) or at(self.c.st, 4) == 0 or data.len() != 2
+            return false
+        let r = data[0] as Int
+        if at(self.c.mute, r) == 1
+            return false
+        if at(self.c.st, 24) == 1 and sealed_refuses(r)
+            return false
+        let lim = at(self.c.st, 95)
+        if lim > 0 and at(self.c.st, 96) >= lim - 1
+            return false
+        self.c.st.insert(96, at(self.c.st, 96) + 1)
+        log_push(self.c, 1)
+        log_push(self.c, r)
+        log_push(self.c, data[1] as Int)
+        chip_write(self.c, r, data[1] as Int)
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if addr != at(self.c.st, 70) or at(self.c.st, 4) == 0
+            return None
+        let r = tx[0] as Int
+        if r == 0x60
+            let lim2 = at(self.c.st, 46)
+            if lim2 > 0 and at(self.c.st, 47) >= lim2 - 1
+                return None
+            self.c.st.insert(47, at(self.c.st, 47) + 1)
+        if at(self.c.deaf, r) == 1
+            return None
+        log_push(self.c, 2)
+        log_push(self.c, r)
+        log_push(self.c, n)
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, chip_read(self.c, r + i) as u8)
+        Some(out)
+
+struct FakePins
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+let W = dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x55), 7)
+
+// The port: every method is the package's own function over the double;
+// the pauses are counted.
+struct Dut
+    bus: FakeI2c
+    pins: FakePins
+    w: DeviceWiring
+
+impl Bq27441Port for Dut
+    fn setup(self) -> Bool [hw]
+        bq27441.i2c_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        bq27441.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        bq27441.i2c_write(self.bus, self.w, reg, v)
+
+    fn pause_ms(self, ms: Int) [hw]
+        self.bus.c.st.insert(90, at(self.bus.c.st, 90) + ms)
+        self.bus.c.st.insert(91, at(self.bus.c.st, 91) + 1)
+
+    fn irq_level(self) -> Int [hw]
+        bq27441.irq_level_of(self.pins, self.w)
+
+fn dut(c: Chip) -> Dut
+    Dut { bus: FakeI2c { c: c },
+        pins: FakePins { levels: HashMap.new(), modes: HashMap.new() },
+        w: W }
+
+fn chip_of(d: Dut) -> Chip
+    d.bus.c
+
+// A gauge with a battery detected.
+fn gauge() -> Dut
+    dut(chip())
+
+// ── The conversions ──────────────────────────────────────────────────
+
+@test
+fn test_temperature_is_tenths_of_a_kelvin() [io]
+    // 298.2 K is 25.05 degC.
+    test.assert_eq(bq27441.temp_milli_c(2982), 25050)
+    // 273.1 K is -0.05 degC; 273.15 K cannot be written in tenths.
+    test.assert_eq(bq27441.temp_milli_c(2731), -50)
+    test.assert_eq(bq27441.temp_milli_c(0), -273150)
+    // The word is 16 bits.
+    test.assert_eq(bq27441.temp_milli_c(0x10000 + 2982), 25050)
+
+@test
+fn test_a_signed_word_reads_negative_above_32767() [io]
+    test.assert_eq(bq27441.signed16(0xFFFF), -1)
+    test.assert_eq(bq27441.signed16(0x7FFF), 32767)
+    test.assert_eq(bq27441.signed16(0x8000), -32768)
+
+@test
+fn test_the_block_checksum_is_255_minus_the_sum() [io]
+    var b: DevBytes = Vec.new()
+    for i in 0..32
+        let _ = b.push(i as u8)
+    // 0 + 1 + ... + 31 = 496 = 0x1F0; the low 8 bits are 0xF0; 255 - 240.
+    test.assert_eq(bq27441.block_checksum(b), 15)
+    var z: DevBytes = Vec.new()
+    for _i in 0..32
+        let _ = z.push(0 as u8)
+    test.assert_eq(bq27441.block_checksum(z), 255)
+
+@test
+fn test_the_checksum_after_a_change_is_the_manuals_example() [io]
+    // SLUUAC9A Section 3.1, steps 7 to 11.  The block checksum read is
+    // 0xE8 (for the -G1B).  Design Capacity 1000 mAh is 0x03 0xE8 and
+    // becomes 1200 mAh, 0x04 0xB0.  By the manual's replacement method:
+    //   x = 255 - 0xE8 - 0x03 - 0xE8 = 23 - 3 - 232 = -212, mod 256 = 44
+    //   the sum with the new bytes: 44 + 0x04 + 0xB0 = 44 + 4 + 176 = 224
+    //   the new checksum: 255 - 224 = 31 = 0x1F.
+    // The manual writes the result as "wr 0x60 0x1F".
+    test.assert_eq(bq27441.checksum_after(0xE8, 0x03, 0xE8, 0x04, 0xB0), 0x1F)
+
+@test
+fn test_the_replacement_method_equals_the_sum_of_the_changed_block() [io]
+    // A block with every byte different, changed at bytes 10 and 11 with
+    // carries in both directions.
+    for case in 0..6
+        var old: DevBytes = Vec.new()
+        var new: DevBytes = Vec.new()
+        for i in 0..32
+            let v = (i * 37 + case * 11) & 0xFF
+            let _ = old.push(v as u8)
+            if i == 10
+                let _ = new.push(((v + 200 + case * 13) & 0xFF) as u8)
+            elif i == 11
+                let _ = new.push(((v + 99 + case * 29) & 0xFF) as u8)
+            else
+                let _ = new.push(v as u8)
+        let csum = bq27441.block_checksum(old)
+        test.assert_eq(bq27441.checksum_after(csum, old[10] as Int, old[11] as Int, new[10] as Int, new[11] as Int),
+            bq27441.block_checksum(new))
+
+// ── The framing ──────────────────────────────────────────────────────
+
+@test
+fn test_an_i2c_read_is_one_transaction_and_a_write_one_byte() [io]
+    let c = chip()
+    let d = dut(c)
+    var b: DevBytes = Vec.new()
+    c.regs.insert(0x04, 0x34)
+    c.regs.insert(0x05, 0x12)
+    test.assert(bq27441.i2c_read_into(d.bus, d.w, 0x04, 2, var b))
+    test.assert_eq(b[0] as Int, 0x34)
+    test.assert(log_list(c) == [2, 0x04, 2])
+    log_clear(c)
+    test.assert(bq27441.i2c_write(d.bus, d.w, 0x61, 0x1FF))
+    test.assert(log_list(c) == [1, 0x61, 0xFF])
+    test.assert(not bq27441.i2c_read_into(dut(absent()).bus, d.w, 0x04, 2, var b))
+    test.assert(not bq27441.i2c_write(dut(absent()).bus, d.w, 0x61, 1))
+    test.assert(not bq27441.i2c_write(d.bus, dev_bus.wiring_spi(0, 25), 0x61, 1))
+
+@test
+fn test_setup_makes_the_bus_and_the_gpout_pin_ready() [io]
+    let c = chip()
+    let d = dut(c)
+    test.assert(bq27441.i2c_setup(d.bus, d.pins, d.w))
+    test.assert_eq(at(c.st, 29), 400000)
+    // GPOUT is open-drain: an input with a pull-up.
+    test.assert_eq(at(d.pins.modes, 7), 2)
+    test.assert(not bq27441.i2c_setup(d.bus, d.pins, dev_bus.wiring_spi(0, 25)))
+    test.assert_eq(bq27441.irq_level_of(d.pins, dev_bus.wiring_i2c(0, 0x55)), -1)
+    d.pins.levels.insert(7, 1)
+    test.assert_eq(bq27441.irq_level_of(d.pins, W), 1)
+    test.assert_eq(d.irq_level(), 1)
+
+@test
+fn test_a_word_is_read_low_byte_first() [io]
+    let c = chip()
+    let d = dut(c)
+    put(c, 0x04, 3700)
+    test.assert_eq(bq27441.word_read(d, 0x04) ?? -1, 3700)
+    c.deaf.insert(0x04, 1)
+    test.assert(bq27441.word_read(d, 0x04) == None)
+
+// ── Control ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_subcommand_is_two_one_byte_packets_low_byte_first() [io]
+    let c = chip()
+    let d = dut(c)
+    test.assert(bq27441.control_send(d, 0x0013))
+    test.assert(log_list(c) == [1, 0x00, 0x13, 1, 0x01, 0x00])
+    log_clear(c)
+    test.assert(bq27441.control_send(d, 0x1234))
+    test.assert(log_list(c) == [1, 0x00, 0x34, 1, 0x01, 0x12])
+    // The first packet is refused: the second is not sent.
+    log_clear(c)
+    c.mute.insert(0, 1)
+    test.assert(not bq27441.control_send(d, 0x0013))
+    test.assert(log_list(c) == [])
+    c.mute.insert(0, 0)
+    c.mute.insert(1, 1)
+    test.assert(not bq27441.control_send(d, 0x0013))
+
+@test
+fn test_a_subcommand_is_read_back_from_control() [io]
+    let d = gauge()
+    test.assert_eq(bq27441.control_read(d, 0x0001) ?? -1, 0x0421)
+    test.assert(bq27441.control_read(dut(absent()), 0x0001) == None)
+    let c = chip_of(d)
+    c.deaf.insert(0, 1)
+    test.assert(bq27441.control_read(d, 0x0001) == None)
+
+@test
+fn test_the_unseal_key_is_0x8000_twice_with_nothing_between() [io]
+    let c = chip()
+    c.st.insert(24, 1)
+    let d = dut(c)
+    test.assert_eq(bq27441.is_sealed(d) ?? false, true)
+    log_clear(c)
+    test.assert(bq27441.unseal(d))
+    test.assert(log_list(c) == [1, 0, 0, 1, 1, 0x80, 1, 0, 0, 1, 1, 0x80])
+    test.assert_eq(bq27441.is_sealed(d) ?? true, false)
+    // One key is not enough.
+    let e = chip()
+    e.st.insert(24, 1)
+    let f = dut(e)
+    test.assert(bq27441.control_send(f, 0x8000))
+    test.assert_eq(bq27441.is_sealed(f) ?? false, true)
+    // A write between the keys starts over.
+    test.assert(bq27441.control_send(f, 0x0001))
+    test.assert(bq27441.control_send(f, 0x8000))
+    test.assert_eq(bq27441.is_sealed(f) ?? false, true)
+    // The part is sealed again by SEALED.
+    test.assert(bq27441.unseal(f))
+    test.assert(bq27441.seal(f))
+    test.assert_eq(bq27441.is_sealed(f) ?? false, true)
+    test.assert(not bq27441.unseal(dut(absent())))
+    test.assert(bq27441.is_sealed(dut(absent())) == None)
+    test.assert(bq27441.control_status(dut(absent())) == None)
+
+@test
+fn test_the_identity_is_device_type_0x0421_with_the_firmware_as_revision() [io]
+    let d = gauge()
+    let id = bq27441.identify(d) ?? DeviceId { who: 0, rev: None }
+    test.assert_eq(id.who, 0x0421)
+    test.assert(id.rev == Some(0x0109))
+    test.assert_eq(bq27441.chem_id(d) ?? -1, 0x0312)
+    test.assert_eq(bq27441.dm_code(d) ?? -1, 1)
+    test.assert(bq27441.identify(dut(absent())) == None)
+    test.assert(bq27441.chem_id(dut(absent())) == None)
+    test.assert(bq27441.dm_code(dut(absent())) == None)
+    // Another type is no BQ27441.
+    let c = chip_of(d)
+    c.st.insert(27, 0x0427)
+    test.assert(bq27441.identify(d) == None)
+    test.assert(not bq27441.start(d))
+
+@test
+fn test_start_checks_the_device_type_and_needs_config_reads_itpor() [io]
+    let d = gauge()
+    test.assert(bq27441.start(d))
+    test.assert(not bq27441.start(dut(absent())))
+    // A wiring the bus cannot use.
+    let c = chip()
+    let w = Dut { bus: FakeI2c { c: c },
+        pins: FakePins { levels: HashMap.new(), modes: HashMap.new() },
+        w: dev_bus.wiring_spi(0, 25) }
+    test.assert(not bq27441.start(w))
+    let e = dut(c)
+    test.assert_eq(bq27441.needs_config(e) ?? true, false)
+    c.st.insert(31, 1)
+    test.assert_eq(bq27441.needs_config(e) ?? false, true)
+    test.assert(bq27441.needs_config(dut(absent())) == None)
+
+// ── The measurements ─────────────────────────────────────────────────
+
+@test
+fn test_every_standard_command_is_read_at_its_register() [io]
+    let c = chip()
+    let d = dut(c)
+    put(c, 0x02, 2982)
+    put(c, 0x04, 3712)
+    put(c, 0x08, 1010)
+    put(c, 0x0A, 1190)
+    put(c, 0x0C, 900)
+    put(c, 0x0E, 1180)
+    put(c, 0x10, 0xFE0C)
+    put(c, 0x12, 0xFFF6)
+    put(c, 0x14, 0xFE70)
+    put(c, 0x18, 0xFC18)
+    put(c, 0x1C, 76)
+    put(c, 0x1E, 2990)
+    put(c, 0x20, 0x0392)
+    test.assert_eq(bq27441.temperature_milli_c(d) ?? 0, 25050)
+    test.assert_eq(bq27441.voltage_mv(d) ?? 0, 3712)
+    test.assert_eq(bq27441.nominal_available_mah(d) ?? 0, 1010)
+    test.assert_eq(bq27441.full_available_mah(d) ?? 0, 1190)
+    test.assert_eq(bq27441.remaining_mah(d) ?? 0, 900)
+    test.assert_eq(bq27441.full_charge_mah(d) ?? 0, 1180)
+    // -500 mA, -10 mA, -400 mA, -1000 mW: discharging.
+    test.assert_eq(bq27441.current_ma(d) ?? 0, -500)
+    test.assert_eq(bq27441.standby_current_ma(d) ?? 0, -10)
+    test.assert_eq(bq27441.max_load_current_ma(d) ?? 0, -400)
+    test.assert_eq(bq27441.power_mw(d) ?? 0, -1000)
+    test.assert_eq(bq27441.soc_percent(d) ?? 0, 76)
+    test.assert_eq(bq27441.internal_temp_milli_c(d) ?? 0, 25850)
+    // The state of health is a percent in the low byte and a status in the
+    // high byte.
+    test.assert_eq(bq27441.soh_percent(d) ?? 0, 0x92)
+    test.assert_eq(bq27441.soh_status(d) ?? 0, 3)
+    test.assert_eq(bq27441.opconfig_read(d) ?? 0, 0x25F8)
+    test.assert_eq(bq27441.design_capacity_mah(d) ?? 0, 1000)
+    log_clear(c)
+    let _ = bq27441.voltage_mv(d)
+    test.assert(log_list(c) == [2, 0x04, 2])
+
+@test
+fn test_no_answer_is_none_for_every_reading() [io]
+    let a = dut(absent())
+    test.assert(bq27441.temperature_milli_c(a) == None)
+    test.assert(bq27441.internal_temp_milli_c(a) == None)
+    test.assert(bq27441.voltage_mv(a) == None)
+    test.assert(bq27441.current_ma(a) == None)
+    test.assert(bq27441.standby_current_ma(a) == None)
+    test.assert(bq27441.max_load_current_ma(a) == None)
+    test.assert(bq27441.power_mw(a) == None)
+    test.assert(bq27441.soc_percent(a) == None)
+    test.assert(bq27441.remaining_mah(a) == None)
+    test.assert(bq27441.full_charge_mah(a) == None)
+    test.assert(bq27441.nominal_available_mah(a) == None)
+    test.assert(bq27441.full_available_mah(a) == None)
+    test.assert(bq27441.soh_percent(a) == None)
+    test.assert(bq27441.soh_status(a) == None)
+    test.assert(bq27441.opconfig_read(a) == None)
+    test.assert(bq27441.design_capacity_mah(a) == None)
+    test.assert(bq27441.flags_read(a) == None)
+
+@test
+fn test_the_battery_is_the_voltage_current_phase_and_percent() [io]
+    let c = chip()
+    let d = dut(c)
+    put(c, 0x04, 3900)
+    put(c, 0x10, 450)
+    put(c, 0x1C, 61)
+    // Charging: a current into the cell.
+    let b = bq27441.battery_read(d) ?? BatteryReading { voltage: MilliVolts { mv: 0 },
+        current: MilliAmps { ma: 0 },
+        charge: ChargeState.ChargeIdle,
+        percent: None }
+    test.assert_eq(b.voltage.mv, 3900)
+    test.assert_eq(b.current.ma, 450)
+    test.assert(b.charge == ChargeState.ChargeConstantCurrent)
+    test.assert(b.percent == Some(61))
+    // Four reads: Flags, Voltage, AverageCurrent, StateOfCharge.
+    log_clear(c)
+    let _ = bq27441.battery_read(d)
+    test.assert(log_list(c) == [2, 0x06, 2, 2, 0x04, 2, 2, 0x10, 2, 2, 0x1C, 2])
+    // Discharging: negative current, idle.
+    put(c, 0x10, 0xFE0C)
+    let e = bq27441.battery_read(d) ?? b
+    test.assert_eq(e.current.ma, -500)
+    test.assert(e.charge == ChargeState.ChargeIdle)
+    // Full charge detected.
+    c.st.insert(30, 0x0208)
+    put(c, 0x10, 5)
+    let f = bq27441.battery_read(d) ?? b
+    test.assert(f.charge == ChargeState.ChargeDone)
+
+@test
+fn test_no_battery_detected_is_none() [io]
+    let c = chip()
+    let d = dut(c)
+    c.st.insert(30, 0)
+    test.assert(bq27441.battery_read(d) == None)
+    test.assert(bq27441.battery_read(dut(absent())) == None)
+    // Each later read failing.
+    c.st.insert(30, 0x0008)
+    c.deaf.insert(0x04, 1)
+    test.assert(bq27441.battery_read(d) == None)
+    c.deaf.insert(0x04, 0)
+    c.deaf.insert(0x10, 1)
+    test.assert(bq27441.battery_read(d) == None)
+    c.deaf.insert(0x10, 0)
+    c.deaf.insert(0x1C, 1)
+    test.assert(bq27441.battery_read(d) == None)
+
+@test
+fn test_the_mode_subcommands_send_their_codes() [io]
+    let c = chip()
+    let d = dut(c)
+    let codes = [[0x000C, 1], [0x000D, 0]]
+    log_clear(c)
+    test.assert(bq27441.battery_present(d, true))
+    test.assert(bq27441.battery_present(d, false))
+    test.assert(bq27441.hibernate_allow(d, true))
+    test.assert(bq27441.hibernate_allow(d, false))
+    test.assert(bq27441.shutdown(d))
+    test.assert(bq27441.pulse_gpout(d))
+    test.assert(bq27441.reset_full(d))
+    // The low bytes sent, in order: BAT_INSERT, BAT_REMOVE, SET_HIBERNATE,
+    // CLEAR_HIBERNATE, SHUTDOWN_ENABLE, SHUTDOWN, TOGGLE_GPOUT, RESET.
+    let l = log_list(c)
+    var lows: [Int] = []
+    var i = 0
+    while i < l.len()
+        if l[i + 1] == 0
+            list.push(lows, l[i + 2])
+        i = i + 3
+    test.assert(lows == [0x0C, 0x0D, 0x11, 0x12, 0x1B, 0x1C, 0x23, 0x41])
+    test.assert_eq(codes.len(), 2)
+    test.assert_eq(at(c.st, 31), 1)
+
+// ── The data memory ──────────────────────────────────────────────────
+
+@test
+fn test_a_data_memory_field_is_most_significant_byte_first() [io]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(bq27441.dm_read_word(d, 82, 10) ?? -1, 1000)
+    // The block read: the control, the class and the block are written,
+    // then the checksum and the 32 bytes are read.
+    log_clear(c)
+    let _ = bq27441.dm_read_word(d, 82, 10)
+    test.assert(log_list(c) == [1, 0x61, 0, 1, 0x3E, 82, 1, 0x3F, 0, 2, 0x60, 1, 2, 0x40, 32])
+    // The 5 ms pause after the block is selected.
+    test.assert_eq(at(c.st, 90), 10)
+    // An offset that leaves the field across two blocks, a negative one.
+    test.assert(bq27441.dm_read_word(d, 82, 31) == None)
+    test.assert(bq27441.dm_read_word(d, 82, -1) == None)
+    // The second block of a class: offset 32 is byte 0 of block 1.
+    dm_word(c, 82, 40, 0x1234)
+    test.assert_eq(bq27441.dm_read_word(d, 82, 40) ?? -1, 0x1234)
+    // A sealed part refuses the selection.
+    c.st.insert(24, 1)
+    test.assert(bq27441.dm_read_word(d, 82, 10) == None)
+    test.assert(bq27441.dm_read_word(dut(absent()), 82, 10) == None)
+    // The checksum answers and the block data does not.
+    c.st.insert(24, 0)
+    c.deaf.insert(0x40, 1)
+    test.assert(bq27441.dm_read_word(d, 82, 10) == None)
+
+@test
+fn test_a_block_that_does_not_match_its_checksum_is_not_used() [io]
+    let c = chip()
+    let d = dut(c)
+    c.st.insert(43, 1)
+    test.assert(bq27441.dm_read_word(d, 82, 10) == None)
+    test.assert_eq(bq27441.dm_write_word(d, 82, 10, 1200), -3)
+    // Nothing was written to the data memory or the block.
+    test.assert_eq(dm_get(c, 82, 10), 1000)
+    let l = log_list(c)
+    var wrote = false
+    var i = 0
+    while i < l.len()
+        if l[i] == 1 and l[i + 1] >= 0x40 and l[i + 1] <= 0x60
+            wrote = true
+        i = i + 3
+    test.assert(not wrote)
+
+@test
+fn test_a_field_is_written_with_its_new_checksum() [io]
+    let c = chip()
+    let d = dut(c)
+    // The manual's example: the sum replacement and the part agree.
+    test.assert_eq(bq27441.dm_write_word(d, 82, 10, 1200), 1)
+    test.assert_eq(dm_get(c, 82, 10), 1200)
+    // The bytes written are the field's two, then the checksum.
+    log_clear(c)
+    test.assert_eq(bq27441.dm_write_word(d, 82, 12, 0x1234), 1)
+    let l = log_list(c)
+    var wr: [Int] = []
+    var i = 0
+    while i < l.len()
+        if l[i] == 1 and l[i + 1] >= 0x40 and l[i + 1] <= 0x60
+            list.push(wr, l[i + 1])
+            list.push(wr, l[i + 2])
+        i = i + 3
+    // The two data bytes at 0x40 + 12, then the checksum register 0x60,
+    // then the reselection of the block for the read back.
+    test.assert_eq(wr[0], 0x4C)
+    test.assert_eq(wr[1], 0x12)
+    test.assert_eq(wr[2], 0x4D)
+    test.assert_eq(wr[3], 0x34)
+    test.assert_eq(wr[4], 0x60)
+    // The 10 ms settle was paused.
+    test.assert(at(c.st, 90) >= 10)
+    // Written again: unchanged, nothing sent to the block.
+    log_clear(c)
+    test.assert_eq(bq27441.dm_write_word(d, 82, 12, 0x1234), 0)
+    let m = log_list(c)
+    var again = false
+    var j = 0
+    while j < m.len()
+        if m[j] == 1 and m[j + 1] >= 0x40 and m[j + 1] <= 0x60
+            again = true
+        j = j + 3
+    test.assert(not again)
+
+@test
+fn test_a_write_is_refused_where_it_cannot_be_done() [io]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(bq27441.dm_write_word(d, 82, 31, 5), -6)
+    test.assert_eq(bq27441.dm_write_word(d, 82, -1, 5), -6)
+    // The part ignores the checksum: the read back differs.
+    c.st.insert(42, 1)
+    test.assert_eq(bq27441.dm_write_word(d, 82, 10, 1200), -4)
+    c.st.insert(42, 0)
+    // Sealed: the selection is refused.
+    c.st.insert(24, 1)
+    test.assert_eq(bq27441.dm_write_word(d, 82, 10, 1200), -1)
+    c.st.insert(24, 0)
+    test.assert_eq(bq27441.dm_write_word(dut(absent()), 82, 10, 1200), -1)
+    // A byte write refused.
+    c.mute.insert(0x4B, 1)
+    test.assert_eq(bq27441.dm_write_word(d, 82, 10, 1200), -1)
+    c.mute.insert(0x4B, 0)
+    // The checksum write refused.
+    c.mute.insert(0x60, 1)
+    test.assert_eq(bq27441.dm_write_word(d, 82, 10, 1200), -1)
+    c.mute.insert(0x60, 0)
+    // The block cannot be reselected for the read back: the seventh write
+    // is the first packet of the second selection.
+    c.st.insert(95, 7)
+    c.st.insert(96, 0)
+    test.assert_eq(bq27441.dm_write_word(d, 82, 10, 1300), -1)
+    c.st.insert(95, 0)
+    // The read back of the checksum does not answer: the second read of 0x60.
+    c.st.insert(46, 2)
+    c.st.insert(47, 0)
+    test.assert_eq(bq27441.dm_write_word(d, 82, 10, 1400), -1)
+
+// ── The configuration update ─────────────────────────────────────────
+
+@test
+fn test_the_configuration_update_writes_the_four_fields() [io]
+    let c = chip()
+    let d = dut(c)
+    let cfg = Bq27441Config { design_mah: 1200,
+        design_mwh: 4440,
+        terminate_mv: 3000,
+        taper_rate: 80,
+        opconfig: None }
+    test.assert_eq(bq27441.config_update(d, cfg, bq27441.EXIT_SOFT_RESET), 4)
+    test.assert_eq(dm_get(c, 82, 10), 1200)
+    test.assert_eq(dm_get(c, 82, 12), 4440)
+    test.assert_eq(dm_get(c, 82, 16), 3000)
+    test.assert_eq(dm_get(c, 82, 27), 80)
+    // Entered CONFIG UPDATE mode and left it by SOFT_RESET; unsealed to
+    // begin with, so not sealed after.
+    test.assert_eq(at(c.st, 32), 0)
+    test.assert_eq(at(c.st, 24), 0)
+    test.assert_eq(at(c.st, 21), 0x0042)
+    // The same configuration again changes nothing.
+    test.assert_eq(bq27441.config_update(d, cfg, bq27441.EXIT_SOFT_RESET), 0)
+    // The terminate voltage and the taper rate are written when they differ,
+    // and OpConfig when it is given.
+    let cfg2 = Bq27441Config { design_mah: 1200,
+        design_mwh: 4440,
+        terminate_mv: 3100,
+        taper_rate: 90,
+        opconfig: Some(0x25FC) }
+    test.assert_eq(bq27441.config_update(d, cfg2, bq27441.EXIT_RESIM), 3)
+    test.assert_eq(dm_get(c, 82, 16), 3100)
+    test.assert_eq(dm_get(c, 82, 27), 90)
+    test.assert_eq(dm_get(c, 64, 0), 0x25FC)
+    test.assert_eq(at(c.st, 21), 0x0044)
+    let cfg3 = Bq27441Config { design_mah: 1200,
+        design_mwh: 4440,
+        terminate_mv: 3100,
+        taper_rate: 90,
+        opconfig: Some(0x25F8) }
+    test.assert_eq(bq27441.config_update(d, cfg3, bq27441.EXIT_CFGUPDATE), 1)
+    test.assert_eq(at(c.st, 21), 0x0043)
+
+@test
+fn test_a_sealed_part_is_unsealed_for_the_update_and_sealed_after() [io]
+    let c = chip()
+    c.st.insert(24, 1)
+    let d = dut(c)
+    test.assert_eq(bq27441.config_update(d, bq27441.config_for(1200, 4440), bq27441.EXIT_SOFT_RESET), 2)
+    test.assert_eq(dm_get(c, 82, 10), 1200)
+    test.assert_eq(at(c.st, 24), 1)
+    // The order: the key twice, SET_CFGUPDATE, the exit, SEALED.
+    let l = log_list(c)
+    var subs: [Int] = []
+    var i = 0
+    while i < l.len()
+        if l[i] == 1 and l[i + 1] == 0
+            list.push(subs, l[i + 2])
+        i = i + 3
+    test.assert(subs[0] == 0)
+    test.assert_eq(subs[subs.len() - 1], 0x20)
+    test.assert_eq(subs[subs.len() - 2], 0x42)
+
+@test
+fn test_the_update_polls_flags_for_the_mode() [io]
+    let c = chip()
+    let d = dut(c)
+    // The mode never sets: -2, and the part is asked to leave it.
+    c.st.insert(35, 1)
+    test.assert_eq(bq27441.config_update(d, bq27441.config_for(1200, 4440), bq27441.EXIT_SOFT_RESET), -2)
+    test.assert_eq(at(c.st, 21), 0x0042)
+    // 100 polls, 25 ms apart.
+    test.assert_eq(at(c.st, 90), 2500)
+    // The mode never clears: -5.
+    let e = chip()
+    e.st.insert(36, 1)
+    test.assert_eq(bq27441.config_update(dut(e), bq27441.config_for(1200, 4440), bq27441.EXIT_SOFT_RESET), -5)
+    test.assert_eq(dm_get(e, 82, 10), 1200)
+
+@test
+fn test_an_error_inside_the_mode_still_leaves_it() [io]
+    let c = chip()
+    let d = dut(c)
+    c.st.insert(43, 1)
+    test.assert_eq(bq27441.config_update(d, bq27441.config_for(1200, 4440), bq27441.EXIT_SOFT_RESET), -3)
+    test.assert_eq(at(c.st, 32), 0)
+    test.assert_eq(at(c.st, 21), 0x0042)
+    // Each field's failure is reported.
+    let e = chip()
+    e.st.insert(42, 1)
+    test.assert_eq(bq27441.config_update(dut(e), bq27441.config_for(1200, 4440), bq27441.EXIT_SOFT_RESET), -4)
+
+@test
+fn test_each_field_failing_after_the_first_is_reported() [io]
+    // Only the field k differs from the part, and the part ignores the
+    // checksum, so its read back differs.
+    for k in 0..5
+        let c = chip()
+        let d = dut(c)
+        var mah = 1000
+        var mwh = 3800
+        var mv = 3200
+        var taper = 100
+        var op: ?Int = None
+        if k == 0
+            mah = 1100
+        if k == 1
+            mwh = 3900
+        if k == 2
+            mv = 3100
+        if k == 3
+            taper = 90
+        if k == 4
+            op = Some(0x25FC)
+        let cfg = Bq27441Config { design_mah: mah,
+            design_mwh: mwh,
+            terminate_mv: mv,
+            taper_rate: taper,
+            opconfig: op }
+        c.st.insert(42, 1)
+        test.assert_eq(bq27441.config_update(d, cfg, bq27441.EXIT_SOFT_RESET), -4)
+
+@test
+fn test_the_update_reports_a_gauge_that_stops_answering() [io]
+    let cfg = bq27441.config_for(1200, 4440)
+    test.assert_eq(bq27441.config_update(dut(absent()), cfg, 0), -1)
+    // The writes of a whole update are 2 for CONTROL_STATUS, 4 for the key
+    // when sealed, 2 for SET_CFGUPDATE, 9 for each of two changed fields and
+    // 3 for each of two unchanged ones, 2 for the exit and 2 for SEALED.
+    // The key is refused after its first packet.
+    let a = chip()
+    a.st.insert(24, 1)
+    a.st.insert(95, 3 + 1)
+    test.assert_eq(bq27441.config_update(dut(a), cfg, 0), -1)
+    // SET_CFGUPDATE is refused.
+    let b = chip()
+    b.st.insert(95, 2 + 1)
+    test.assert_eq(bq27441.config_update(dut(b), cfg, 0), -1)
+    // The exit is refused: 2 + 2 + 24 writes come before it.
+    let e = chip()
+    e.st.insert(95, 28 + 1)
+    test.assert_eq(bq27441.config_update(dut(e), cfg, 0), -1)
+    // Sealing again is refused: 2 + 4 + 2 + 24 + 2 come before it.
+    let f = chip()
+    f.st.insert(24, 1)
+    f.st.insert(95, 34 + 1)
+    test.assert_eq(bq27441.config_update(dut(f), cfg, 0), -1)
+
+// ── The awaitable GPOUT line ─────────────────────────────────────────
+
+struct FakeEdge
+    seen: HashMap<Int, Int>
+    refuse: Int
+
+impl AsyncEdge[] for FakeEdge
+    fn edge_arm(self, pin: Int, edge: Int, f: Future) -> Int
+        if self.refuse == 1
+            return -2
+        self.seen.insert(pin, edge)
+        0
+
+    fn edge_disarm(self, pin: Int) -> Bool
+        self.seen.insert(pin + 1000, 1)
+        true
+
+    fn edge_irqs(self) -> Int
+        0
+
+@test
+fn test_the_gpout_line_is_armed_for_a_falling_edge() [io, async]
+    let f = core.rt.future_new()
+    let e = FakeEdge { seen: HashMap.new(), refuse: 0 }
+    test.assert_eq(bq27441.alert_arm(e, W, f), 0)
+    test.assert_eq(at(e.seen, 7), 1)
+    test.assert(bq27441.alert_disarm(e, W))
+    test.assert_eq(at(e.seen, 1007), 1)
+    test.assert_eq(bq27441.alert_arm(e, dev_bus.wiring_i2c(0, 0x55), f), -1)
+    test.assert(not bq27441.alert_disarm(e, dev_bus.wiring_i2c(0, 0x55)))
+    test.assert_eq(bq27441.alert_arm(FakeEdge { seen: HashMap.new(), refuse: 1 }, W, f), -2)
+    core.rt.future_drop(f)
+
+// ── The host scheduler's async form ──────────────────────────────────
+
+@test
+fn test_the_async_form_waits_for_initialization_then_answers() [io, hw, time, async]
+    let c = chip()
+    put(c, 0x04, 3900)
+    put(c, 0x1C, 80)
+    // INITCOMP reads clear for two reads of CONTROL_STATUS.
+    c.st.insert(26, 2)
+    let h = bq27441.host_of(dut(c))
+    let b = await h.battery_measure()
+    test.assert_eq((b ?? BatteryReading { voltage: MilliVolts { mv: 0 },
+        current: MilliAmps { ma: 0 },
+        charge: ChargeState.ChargeIdle,
+        percent: None }).voltage.mv,
+    3900)
+
+@test
+fn test_the_async_form_gives_up_when_the_gauge_does_not_answer() [io, hw, time, async]
+    let a = bq27441.host_of(dut(absent()))
+    test.assert(await a.battery_measure() == None)
+    // INITCOMP never sets: after the polls the battery is read anyway.
+    let c = chip()
+    c.st.insert(25, 0)
+    let h = bq27441.host_of(dut(c))
+    test.assert(await h.battery_measure() != None)
+
+// ── The part on a board's handles ────────────────────────────────────
+
+@test
+fn test_the_type_over_the_host_s_board_handles_answers_as_absent_hardware() [io]
+    // The host's board handles drive no hardware: every read fails.
+    let g = Bq27441.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, W)
+    test.assert(not g.begin())
+    g.pause_ms(1)
+    test.assert(g.needs_config() == None)
+    test.assert_eq(g.configure(bq27441.config_for(1200, 4440)), -1)
+    test.assert(g.voltage() == None)
+    test.assert(g.current() == None)
+    test.assert(g.soc() == None)
+    test.assert(g.remaining() == None)
+    test.assert(g.temperature() == None)
+    test.assert(g.flags() == None)
+    test.assert_eq(g.gpout(), 0)
+    test.assert(not g.seal())
+    test.assert(not g.unseal())
+    test.assert(g.battery() == None)
+    test.assert(g.device_id() == None)
+    test.assert(not g.device_probe(0x0421))
+    // The PowerManager of a gauge: no rail.
+    test.assert_eq(g.rail_count(), 0)
+    test.assert(g.rail_state(0) == RailState.RailOff)
+    test.assert(g.rail_voltage(0) == None)
+    test.assert(g.rail_set_voltage(0, MilliVolts { mv: 3300 }) == None)
+    test.assert(not g.rail_enable(0, true))
+    test.assert(not g.rail_is_on(0))
+    test.assert(g.rail_current(0) == None)

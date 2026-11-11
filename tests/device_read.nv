@@ -1,0 +1,55 @@
+// device_read — a monitoring loop for a BQ27441-G1 fuel gauge on a
+// breakout, for an nRF52840 DK or an nRF54LM20 DK.
+//
+// The breakout's SDA and SCL go to the board's I2C pins, with pull-ups on
+// the board or the breakout, and the gauge sits at 0x55.  The cell is
+// 1200 mAh at 3.7 V.  The program waits 300 ms for the gauge to start
+// (the data sheet gives 250 ms), checks DEVICE_TYPE, writes the cell's
+// capacity, energy, terminate voltage and taper rate to the gauge when it
+// reports a power-on reset (ITPOR), and once a second prints one line over
+// RTT:
+//
+//     bq27441 mV=<millivolts> mA=<milliamps> pct=<percent> mC=<millidegrees>
+//
+// The current is positive while the cell charges.
+//
+// Build it with `novo build --target=nrf52840-dk tests/device_read.nv` or
+// `novo build --target=nrf54lm20-dk tests/device_read.nv`.
+
+use embedded_hal.{ BoardI2c, BoardTimer, BoardGpio }
+use dev_bus
+use bq27441
+use bq27441.{ Bq27441 }
+
+// The gauge's address.
+const ADDR = 0x55
+
+// A label and a number, written without building a string.
+fn field(label: Str, v: Int) [hw]
+    hal.uart.write(label)
+    hal.uart.write(str.from_int(v))
+
+@tier(embedded)
+fn main() [hw]
+    let gauge = Bq27441.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
+    hal.timer.delay_ms(300)
+    if not gauge.begin()
+        hal.uart.write("bq27441: no answer\n")
+        return
+    if gauge.needs_config() == Some(true)
+        let wrote = gauge.configure(bq27441.config_for(1200, 4440))
+        if wrote < 0
+            field("bq27441: configuration failed ", wrote)
+            hal.uart.write("\n")
+    loop
+        match gauge.battery()
+            Some(b) =>
+                hal.uart.write("bq27441")
+                field(" mV=", b.voltage.mv)
+                field(" mA=", b.current.ma)
+                field(" pct=", b.percent ?? -1)
+                field(" mC=", gauge.temperature() ?? -273150)
+                hal.uart.write("\n")
+            None    =>
+                hal.uart.write("bq27441: no battery\n")
+        hal.timer.delay_ms(1000)
