@@ -19,7 +19,7 @@
 // 47 the reads made, 95 is 1 more than the writes after which every write is
 // refused (0 for no limit) and 96 the writes made, 42 is 1 when the checksum written is ignored, 43 adds to
 // the checksum the gauge reports, 44 the block data control, 90 the
-// milliseconds paused, 91 the pauses, 99 the entries in the log.  `regs`
+// milliseconds the bus waited, 91 the waits, 99 the entries in the log.  `regs`
 // holds the standard registers, `dm` the data memory as one byte at
 // `class * 4096 + offset`, `stage` the 32 bytes of the selected block.
 // The log is: a register written is 1, the register and the value; a
@@ -27,9 +27,10 @@
 
 use std.test
 use core.rt
-use embedded_hal.{ BoardI2c, BoardTimer, BoardGpio, I2cBus, GpioOut, AsyncEdge }
+use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut, AsyncEdge }
 use dev_bus.{ DeviceWiring, DevBytes }
-use dev_power.{ MilliVolts, MilliAmps, RailState, ChargeState, BatteryReading, PowerManager, PowerManagerAsync }
+use dev_power.{ MilliVolts, MilliAmps, MilliAmpHours, RailState, ChargeState, BatteryReading, BatteryCapacity, BatteryHealth, PowerManager, PowerManagerAsync }
+use dev_thermo.{ TempMilliC }
 use dev_id.{ DeviceId, Identifiable }
 use bq27441
 use bq27441.{ Bq27441, Bq27441Port, Bq27441Config, Bq27441Host }
@@ -235,6 +236,11 @@ impl I2cBus for FakeI2c
     fn init(self, freq: Int) [hw]
         self.c.st.insert(29, freq)
 
+    // The bus waits for the driver: the waits are counted, not spent.
+    fn delay_ms(self, ms: Int) [hw]
+        self.c.st.insert(90, at(self.c.st, 90) + ms)
+        self.c.st.insert(91, at(self.c.st, 91) + 1)
+
     fn write(self, addr: Int, data: [u8]) -> Bool [hw]
         if addr != at(self.c.st, 70) or at(self.c.st, 4) == 0 or data.len() != 2
             return false
@@ -293,7 +299,7 @@ impl GpioOut for FakePins
 let W = dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x55), 7)
 
 // The port: every method is the package's own function over the double;
-// the pauses are counted.
+// the pauses are the bus's waits, which the double counts.
 struct Dut
     bus: FakeI2c
     pins: FakePins
@@ -310,8 +316,7 @@ impl Bq27441Port for Dut
         bq27441.i2c_write(self.bus, self.w, reg, v)
 
     fn pause_ms(self, ms: Int) [hw]
-        self.bus.c.st.insert(90, at(self.bus.c.st, 90) + ms)
-        self.bus.c.st.insert(91, at(self.bus.c.st, 91) + 1)
+        self.bus.delay_ms(ms)
 
     fn irq_level(self) -> Int [hw]
         bq27441.irq_level_of(self.pins, self.w)
@@ -563,6 +568,42 @@ fn test_every_standard_command_is_read_at_its_register() [io]
     log_clear(c)
     let _ = bq27441.voltage_mv(d)
     test.assert(log_list(c) == [2, 0x04, 2])
+
+@test
+fn test_the_capacity_the_temperature_and_the_health_are_the_power_manager_s() [io]
+    let c = chip()
+    let d = dut(c)
+    put(c, 0x02, 2982)
+    put(c, 0x0C, 900)
+    put(c, 0x0E, 1180)
+    // PowerManager.battery_capacity: the remaining and the full-charge
+    // capacity, in two reads.
+    log_clear(c)
+    let cap = bq27441.battery_capacity_of(d) ?? BatteryCapacity { remaining: MilliAmpHours { mah: -1 },
+        full: MilliAmpHours { mah: -1 } }
+    test.assert_eq(cap.remaining.mah, 900)
+    test.assert_eq(cap.full.mah, 1180)
+    test.assert(log_list(c) == [2, 0x0C, 2, 2, 0x0E, 2])
+    // PowerManager.battery_temperature: 298.2 K is 25.05 degC.
+    test.assert_eq((bq27441.battery_temperature_of(d) ?? TempMilliC { milli_c: 0 }).milli_c, 25050)
+    // PowerManager.battery_health: Flags' OT and UT bits, with a battery
+    // detected.
+    test.assert(bq27441.battery_health_of(d) == BatteryHealth.HealthGood)
+    c.st.insert(30, 0x0008 | 0x8000)
+    test.assert(bq27441.battery_health_of(d) == BatteryHealth.HealthOverheat)
+    c.st.insert(30, 0x0008 | 0x4000)
+    test.assert(bq27441.battery_health_of(d) == BatteryHealth.HealthCold)
+    // The flags are not valid without a battery.
+    c.st.insert(30, 0x8000)
+    test.assert(bq27441.battery_health_of(d) == BatteryHealth.HealthUnknown)
+    // A part that does not answer, or answers one of the two reads.
+    let a = dut(absent())
+    test.assert(bq27441.battery_capacity_of(a) == None)
+    test.assert(bq27441.battery_temperature_of(a) == None)
+    test.assert(bq27441.battery_health_of(a) == BatteryHealth.HealthUnknown)
+    let h = chip()
+    h.deaf.insert(0x0E, 1)
+    test.assert(bq27441.battery_capacity_of(dut(h)) == None)
 
 @test
 fn test_no_answer_is_none_for_every_reading() [io]
@@ -972,7 +1013,7 @@ fn test_the_async_form_gives_up_when_the_gauge_does_not_answer() [io, hw, time, 
 @test
 fn test_the_type_over_the_host_s_board_handles_answers_as_absent_hardware() [io]
     // The host's board handles drive no hardware: every read fails.
-    let g = Bq27441.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, W)
+    let g = Bq27441.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, W)
     test.assert(not g.begin())
     g.pause_ms(1)
     test.assert(g.needs_config() == None)
@@ -980,8 +1021,9 @@ fn test_the_type_over_the_host_s_board_handles_answers_as_absent_hardware() [io]
     test.assert(g.voltage() == None)
     test.assert(g.current() == None)
     test.assert(g.soc() == None)
-    test.assert(g.remaining() == None)
-    test.assert(g.temperature() == None)
+    test.assert(g.battery_capacity() == None)
+    test.assert(g.battery_temperature() == None)
+    test.assert(g.battery_health() == BatteryHealth.HealthUnknown)
     test.assert(g.flags() == None)
     test.assert_eq(g.gpout(), 0)
     test.assert(not g.seal())

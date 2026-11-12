@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0, which
+are path dependencies until they are published.
+
+- `remaining()` and `temperature()` on `Bq27441` are gone.
+  `PowerManager.battery_capacity` answers the remaining and the full-charge
+  capacity in mAh, and `PowerManager.battery_temperature` the temperature as
+  a `TempMilliC`, where `temperature()` answered a bare `Int`.
+- `battery_health()` answers `HealthOverheat` for Flags' OT, `HealthCold` for
+  UT, `HealthGood` between them, and `HealthUnknown` when the part does not
+  answer or BAT_DET is clear.
+- `attach(bus, pins, w)` has no `BoardTimer`: the bus-free time after a
+  packet and the waits go through `I2cBus.delay_us` and `delay_ms`.
+
 ## 0.1.0
 
 The first release: a driver for TI's BQ27441-G1 single-cell fuel gauge on

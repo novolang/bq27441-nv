@@ -16,7 +16,7 @@
 // Build it with `novo build --target=nrf52840-dk tests/device_read.nv` or
 // `novo build --target=nrf54lm20-dk tests/device_read.nv`.
 
-use embedded_hal.{ BoardI2c, BoardTimer, BoardGpio }
+use embedded_hal.{ BoardI2c, BoardGpio }
 use dev_bus
 use bq27441
 use bq27441.{ Bq27441 }
@@ -31,7 +31,7 @@ fn field(label: Str, v: Int) [hw]
 
 @tier(embedded)
 fn main() [hw]
-    let gauge = Bq27441.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
+    let gauge = Bq27441.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
     hal.timer.delay_ms(300)
     if not gauge.begin()
         hal.uart.write("bq27441: no answer\n")
@@ -48,7 +48,9 @@ fn main() [hw]
                 field(" mV=", b.voltage.mv)
                 field(" mA=", b.current.ma)
                 field(" pct=", b.percent ?? -1)
-                field(" mC=", gauge.temperature() ?? -273150)
+                match gauge.battery_temperature()
+                    Some(t) => field(" mC=", t.milli_c)
+                    None    => hal.uart.write(" mC=?")
                 hal.uart.write("\n")
             None    =>
                 hal.uart.write("bq27441: no battery\n")

@@ -28,7 +28,7 @@ power-on reset, and once a second prints one line over RTT.  The current is
 positive while the cell charges.
 
 ```novo norun:needs-pkg
-use embedded_hal.{ BoardI2c, BoardTimer, BoardGpio }
+use embedded_hal.{ BoardI2c, BoardGpio }
 use dev_bus
 use bq27441
 use bq27441.{ Bq27441 }
@@ -43,7 +43,7 @@ fn field(label: Str, v: Int) [hw]
 
 @tier(embedded)
 fn main() [hw]
-    let gauge = Bq27441.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
+    let gauge = Bq27441.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
     hal.timer.delay_ms(300)
     if not gauge.begin()
         hal.uart.write("bq27441: no answer\n")
@@ -60,7 +60,9 @@ fn main() [hw]
                 field(" mV=", b.voltage.mv)
                 field(" mA=", b.current.ma)
                 field(" pct=", b.percent ?? -1)
-                field(" mC=", gauge.temperature() ?? -273150)
+                match gauge.battery_temperature()
+                    Some(t) => field(" mC=", t.milli_c)
+                    None    => hal.uart.write(" mC=?")
                 hal.uart.write("\n")
             None =>
                 hal.uart.write("bq27441: no battery\n")
@@ -151,7 +153,7 @@ The bus is I2C at 400 kHz, address 0x55.  The data sheet asks for a bus-free
 time of at least 66 microseconds between all packets addressed to the part,
 and, above 100 kHz, for individual 1-byte writes.  The driver writes a
 Control subcommand as two 1-byte packets, register 0x00 then 0x01; the
-board's type waits 66 microseconds after every packet.
+board's type waits 66 microseconds after every packet, through the bus.
 
 ## What the package contains
 
@@ -162,29 +164,33 @@ board's type waits 66 microseconds after every packet.
 ## How to choose an entry point
 
 A program on a board uses `Bq27441`.  It is built by `attach` with the
-board's bus, its timer, its GPIO and the wiring, as a board's device table
-builds it.  It implements `PowerManager` (the battery side) and
+board's bus, its GPIO and the wiring, as a board's device table builds it.
+The waits go through the bus (`I2cBus.delay_us` and `delay_ms`), so there is
+no timer slot.  It implements `PowerManager` (the battery side) and
 `Identifiable`.
 
 | Method | What it does |
 |---|---|
-| `attach(bus, timer, pins, w)` | the gauge at `w.addr`; nothing is sent |
+| `attach(bus, pins, w)` | the gauge at `w.addr`; nothing is sent |
 | `begin()` | makes the bus ready and checks DEVICE_TYPE; the program waits 250 ms or more after power-up first |
 | `needs_config()` | whether ITPOR is set |
 | `configure(cfg)` | the configuration update, see below |
 | `battery()` | `PowerManager`: the voltage, the average current, the phase and the percent; `None` while no battery is detected |
-| `voltage()`, `current()`, `soc()`, `remaining()`, `temperature()`, `flags()` | one reading each |
+| `battery_capacity()` | `PowerManager`: the remaining and the full-charge capacity in mAh, two reads |
+| `battery_temperature()` | `PowerManager`: the cell temperature in millidegrees Celsius |
+| `battery_health()` | `PowerManager`: cold or overheat from Flags' UT and OT, good between, unknown without a battery |
+| `voltage()`, `current()`, `soc()`, `flags()` | one reading each |
 | `device_id()` | `Identifiable`: DEVICE_TYPE, 0x0421, with the firmware version as `rev` |
 | `seal()`, `unseal()` | the access mode |
 | `gpout()` | the level of the GPOUT line, -1 for a wiring with none |
 
 The gauge supplies no rail: `rail_count` answers 0, and the other rail
-methods answer as for a rail the part does not have.  The `PowerManager`
-trait has no capacity, so the capacities are the module's own functions:
-`remaining_mah`, `full_charge_mah`, `nominal_available_mah` and
-`full_available_mah`.  The module's functions take a `Bq27441Port`, the
-trait a type that holds a bus implements, so a test runs them over a
-double.
+methods answer as for a rail the part does not have.  The remaining and the
+full-charge capacity are `PowerManager.battery_capacity`; the uncompensated
+capacities stay the module's own functions, `nominal_available_mah` and
+`full_available_mah`, beside `remaining_mah` and `full_charge_mah`.  The
+module's functions take a `Bq27441Port`, the trait a type that holds a bus
+implements, so a test runs them over a double.
 
 `battery()` reads Flags, Voltage, AverageCurrent and StateOfCharge, four
 transactions.  The phase is not the gauge's to know: a full cell (FC) is
@@ -299,8 +305,8 @@ refuses an `async fn`.
   this driver implements, the wiring record and the register helpers it
   uses.
 - [embedded-hal-nv](https://novo-lang.org/packages/embedded-hal-nv) names
-  the `I2cBus`, `Timer`, `GpioOut` and `AsyncEdge` traits and the board
-  handles.
+  the `I2cBus` (which also waits), `GpioOut` and `AsyncEdge` traits and the
+  board handles.
 - max17048-nv drives Analog Devices' MAX17048, a fuel gauge without a sense
   resistor, on the same trait; axp2101-nv and bq25895-nv drive a PMIC and a
   charger on the charger side of it.

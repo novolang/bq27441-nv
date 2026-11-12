@@ -69,9 +69,10 @@
 // 0.3.0).  Each fix kept is named at its site.
 
 use core.rt
-use embedded_hal.{ BoardI2c, BoardTimer, BoardGpio, I2cBus, GpioOut, Timer, AsyncEdge }
+use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut, AsyncEdge }
 use dev_bus.{ DeviceWiring, DevBytes }
-use dev_power.{ MilliVolts, MilliAmps, RailState, ChargeState, BatteryReading, PowerManager, PowerManagerAsync }
+use dev_power.{ MilliVolts, MilliAmps, MilliAmpHours, RailState, ChargeState, BatteryReading, BatteryCapacity, BatteryHealth, PowerManager, PowerManagerAsync }
+use dev_thermo.{ TempMilliC }
 use dev_id.{ DeviceId, Identifiable }
 
 // The standard and extended commands.
@@ -527,6 +528,36 @@ pub fn battery_read<P: Bq27441Port>(p: P) -> ?BatteryReading [hw]
         charge: phase,
         percent: Some(soc) })
 
+// The charge `PowerManager.battery_capacity` answers: the remaining and
+// the full-charge capacity, both compensated, in mAh, in two reads.  `None`
+// when the part does not answer.
+pub fn battery_capacity_of<P: Bq27441Port>(p: P) -> ?BatteryCapacity [hw]
+    let Some(rm) = remaining_mah(p) else return None
+    let Some(fcc) = full_charge_mah(p) else return None
+    Some(BatteryCapacity { remaining: MilliAmpHours { mah: rm },
+        full: MilliAmpHours { mah: fcc } })
+
+// The cell temperature `PowerManager.battery_temperature` answers, from the
+// sensor OpConfig's TEMPS selects, or `None` when the part does not answer.
+pub fn battery_temperature_of<P: Bq27441Port>(p: P) -> ?TempMilliC [hw]
+    let Some(t) = temperature_milli_c(p) else return None
+    Some(TempMilliC { milli_c: t })
+
+// The cell's condition `PowerManager.battery_health` answers, from Flags: OT
+// is `HealthOverheat` and UT `HealthCold`, and a cell inside the limits is
+// `HealthGood`.  `HealthUnknown` when the part does not answer and when
+// BAT_DET is clear, since the gauge's flags are not valid without a cell.
+// The gauge has no flag for an over-voltage or a dead cell.
+pub fn battery_health_of<P: Bq27441Port>(p: P) -> BatteryHealth [hw]
+    let Some(fl) = flags_read(p) else return BatteryHealth.HealthUnknown
+    if (fl & FLAG_BAT_DET) == 0
+        return BatteryHealth.HealthUnknown
+    if (fl & FLAG_OT) != 0
+        return BatteryHealth.HealthOverheat
+    if (fl & FLAG_UT) != 0
+        return BatteryHealth.HealthCold
+    BatteryHealth.HealthGood
+
 // ── Modes ────────────────────────────────────────────────────────────
 
 // Tells the part a battery is present (BAT_INSERT), for OpConfig's BIE
@@ -737,6 +768,10 @@ pub fn config_for(mah: Int, mwh: Int) -> Bq27441Config
 
 // ── The awaitable GPOUT line ─────────────────────────────────────────
 
+// Stays a package function (planning page 3.5, the AsyncDeviceReady row):
+// no board's `BoardGpio` implements `AsyncEdge`, so a board driver cannot
+// implement `AsyncDeviceReady`.
+
 // Arms the GPOUT line on a pin-edge source: the Future `f` resolves with
 // the level captured when the line falls, which is the part's alert or
 // state-of-charge pulse with OpConfig's GPIOPOL clear, its default.  `edge`
@@ -757,12 +792,11 @@ pub fn alert_disarm<E: AsyncEdge[e]>(edge: E, w: DeviceWiring) -> Bool [e]
 // ── The part on a board ──────────────────────────────────────────────
 
 // A BQ27441-G1 on a board's I2C bus at the address `w.addr`, 0x55, with
-// the board's timer for the bus-free time and the waits, and its GPIO for
-// the GPOUT line.
+// the bus for the bus-free time and the waits (`I2cBus.delay_us` and
+// `delay_ms`), and the board's GPIO for the GPOUT line.
 pub @value
 struct Bq27441
     bus: BoardI2c
-    timer: BoardTimer
     pins: BoardGpio
     w: DeviceWiring
 
@@ -772,16 +806,16 @@ impl Bq27441Port for Bq27441
 
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         let ok = i2c_read_into(self.bus, self.w, reg, n, var dst)
-        self.timer.delay_us(GAP_US)
+        self.bus.delay_us(GAP_US)
         ok
 
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         let ok = i2c_write(self.bus, self.w, reg, v)
-        self.timer.delay_us(GAP_US)
+        self.bus.delay_us(GAP_US)
         ok
 
     fn pause_ms(self, ms: Int) [hw]
-        self.timer.delay_ms(ms)
+        self.bus.delay_ms(ms)
 
     fn irq_level(self) -> Int [hw]
         irq_level_of(self.pins, self.w)
@@ -789,8 +823,8 @@ impl Bq27441Port for Bq27441
 impl Bq27441
     // The part at `w.addr` on the board's bus, as a board's device table
     // builds it.  Nothing is sent.
-    fn attach(bus: BoardI2c, timer: BoardTimer, pins: BoardGpio, w: DeviceWiring) -> Bq27441
-        Bq27441 { bus: bus, timer: timer, pins: pins, w: w }
+    fn attach(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring) -> Bq27441
+        Bq27441 { bus: bus, pins: pins, w: w }
 
     // Makes the bus ready and checks DEVICE_TYPE (`start`).  The part is
     // powered at least 250 ms before this.
@@ -816,14 +850,6 @@ impl Bq27441
     // The state of charge in percent.
     fn soc(self) -> ?Int [hw]
         soc_percent(self)
-
-    // The remaining capacity in mAh.
-    fn remaining(self) -> ?Int [hw]
-        remaining_mah(self)
-
-    // The cell temperature in millidegrees Celsius.
-    fn temperature(self) -> ?Int [hw]
-        temperature_milli_c(self)
 
     // The Flags word.
     fn flags(self) -> ?Int [hw]
@@ -864,6 +890,18 @@ impl PowerManager[hw] for Bq27441
     fn battery(self) -> ?BatteryReading [hw]
         battery_read(self)
 
+    // The remaining and the full-charge capacity in mAh.
+    fn battery_capacity(self) -> ?BatteryCapacity [hw]
+        battery_capacity_of(self)
+
+    // From Flags: over-temperature, under-temperature, else good.
+    fn battery_health(self) -> BatteryHealth [hw]
+        battery_health_of(self)
+
+    // The cell temperature in millidegrees Celsius.
+    fn battery_temperature(self) -> ?TempMilliC [hw]
+        battery_temperature_of(self)
+
 impl Identifiable[hw] for Bq27441
     // DEVICE_TYPE, 0x0421, with the firmware version as `rev`.
     fn device_id(self) -> ?DeviceId [hw]
@@ -871,6 +909,10 @@ impl Identifiable[hw] for Bq27441
 
 // ── The host scheduler's async form ──────────────────────────────────
 
+// Stays as it is (planning page 3.5, the `*Async` row): an `async fn` takes
+// no `@value` struct and the embedded tier refuses it, so this is a plain
+// struct with an `@tier(app)` impl.
+//
 // A part on the host scheduler, which implements `PowerManagerAsync`:
 // `battery_measure` waits for the gauge's initialization to complete
 // (CONTROL_STATUS' INITCOMP, which "could take up to 10 seconds" after a
