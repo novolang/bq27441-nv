@@ -1,6 +1,6 @@
 [package]
 name        = "bq27441-nv"
-version     = "0.1.0"
+version     = "0.2.0"
 description = "A driver for TI's BQ27441-G1 single-cell fuel gauge on an I2C bus: voltage, average current, power, state of charge, remaining and full-charge capacity, temperature, state of health and the Flags bits, the Control subcommands and the seal and unseal keys, the configuration update that writes the design capacity, design energy, terminate voltage, taper rate and OpConfig through the data memory with its block checksum, and the device identity, as the battery side of devices-nv's PowerManager and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"

@@ -25,13 +25,13 @@ cp "$PKG/tests/device_read.nv" "$WORK/src/main.nv"
 cat > "$WORK/novo.toml" <<EOF
 [package]
 name    = "bq27441-nv-device"
-version = "0.1.0"
+version = "0.2.0"
 main    = "src/main.nv"
 
 [dependencies]
 bq27441-nv       = { path = "$PKG" }
-devices-nv      = { path = "$PKG/../devices-nv" }
-embedded-hal-nv = { path = "$PKG/../embedded-hal-nv" }
+devices-nv      = "^0.4.0"
+embedded-hal-nv = "^0.4.0"
 EOF
 
 fail=0
